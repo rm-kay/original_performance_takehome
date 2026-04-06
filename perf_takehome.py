@@ -415,16 +415,6 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
-        instrs = []
-        for engine, slot in slots:
-            if isinstance(slot, list):
-                instrs.append({engine: slot})
-            else:
-                instrs.append({engine: [slot]})
-        return instrs
-
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
 
@@ -467,11 +457,7 @@ class KernelBuilder:
             addr = self.alloc_scratch(name)
             if val2 is not None:
                 addr2 = self.alloc_scratch(name)
-            # app = {"load": [("const", addr, val)] + ([] if val2 is None else ["const", addr2, val2])}
-            # print(app)
-            self.instrs.append(
-                {"load": [("const", addr, val)] + ([] if val2 is None else [("const", addr2, val2)])}
-            )
+            self.instrs.append({"load": [("const", addr, val)] + ([] if val2 is None else [("const", addr2, val2)])})
             self.const_map[val] = addr
             if val2 is not None:
                 self.const_map[val2] = addr2
@@ -634,7 +620,6 @@ class KernelBuilder:
         val_ptr_base = self.alloc_scratch("val_ptrs", n_chunks)
         for k in range(0, n_chunks, 2):
             off_c, off_c2 = self.scratch_const(k * VLEN, k * VLEN + VLEN)
-            # off_c = self.scratch_const(k * VLEN)
             self.instrs.append({"alu": [
                 ("+", idx_ptr_base + k, inp_indices_p_s, off_c),
                 ("+", val_ptr_base + k, inp_values_p_s,  off_c),
@@ -654,7 +639,7 @@ class KernelBuilder:
         self.add("debug", ("comment", "Starting loop"))
 
         instrs_pre = []
-        instrs_by_i = {}
+        all_instrs = instrs_pre
 
         # Pre-emit all constants needed by the hash at the top of instrs_pre so they
         # are visible to the dep-graph and can be scheduled alongside the nv preloads
@@ -918,15 +903,10 @@ class KernelBuilder:
                         if is_last:
                             instrs.append({"store": [("vstore", val_ptr_base + k, vr_hashed)]})
 
-            instrs_by_i[i] = instrs
+            all_instrs.extend(instrs)
 
-        # Combine all iterations into a single dep graph so the scheduler can
-        # interleave instructions from different pipelines and iterations for
-        # maximum VLIW slot utilization.
-        all_instrs = instrs_pre
-        for i in range(0, batch_size, PIPELINE * VLEN):
-            all_instrs = all_instrs + instrs_by_i[i]
-
+        # Build dep graph across all iterations so the scheduler can interleave
+        # instructions from different pipelines for maximum VLIW slot utilization.
         nodes = build_dep_graph(all_instrs)
 
         sched, sched_stats = schedule(nodes, collect_stats=True)
@@ -968,7 +948,6 @@ def do_kernel_test(
 
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
-    # print(kb.instrs)
 
     value_trace = {}
     machine = Machine(
@@ -986,11 +965,6 @@ def do_kernel_test(
         if prints:
             print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
             print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
-
-        # if i == 0:
-        # print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
-        # print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
-
         assert (
             machine.mem[inp_values_p : inp_values_p + len(inp.values)]
             == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
