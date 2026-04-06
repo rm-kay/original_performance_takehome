@@ -89,7 +89,6 @@ def _slot_rw(engine: str, slot: tuple) -> tuple[set, set]:
     op = slot[0]
     if engine == "alu":
         # Slots are per-lane: (op, dest_lane, src1_lane, src2_lane)
-        # dest/src are int or VRegLane (from _lane() in vexec_alu/vexec_valu)
         _, dest, src1, src2 = slot
         writes.add(dest)
         reads.update({src1, src2})
@@ -199,13 +198,25 @@ def build_dep_graph(instrs: list[dict]) -> list[InstrNode]:
     return nodes
 
 
-def schedule(nodes: list[InstrNode]) -> list[dict]:
+def schedule(nodes: list[InstrNode], collect_stats: bool = False):
     """
-    Greedy FIFO topological scheduler: pack as many ready instructions as
-    possible into each VLIW cycle, processing the ready queue in FIFO order
-    so pipeline-slot chains naturally interleave.
+    Per-engine-queue FIFO scheduler: each engine type (load, valu, alu, …) has
+    its own ready deque. Every cycle each engine fills its slots independently
+    from its own queue, so a backlog of VALU work never starves waiting LOAD
+    instructions and vice-versa. This beats both critical-path (heapq) and a
+    single shared FIFO for workloads with many independent parallel chains.
+
+    If collect_stats=True, returns (cycles, stats_dict) where stats_dict maps
+    each engine to counts:
+      dep_stall   – cycle had no ready ops in the engine's queue at all
+      resource_stall – cycle had ready ops but some were deferred (couldn't fit)
+      full        – cycle hit the engine's slot limit
+      partial     – cycle used some slots, hit no limit, and deferred nothing
+                    (queue drained before engine was saturated)
     """
     if not nodes:
+        if collect_stats:
+            return [], {}
         return []
 
     n = len(nodes)
@@ -215,7 +226,23 @@ def schedule(nodes: list[InstrNode]) -> list[dict]:
         for dep_id in node.deps:
             successors[dep_id].append(node.id)
 
-    ready: deque[int] = deque(i for i in range(n) if in_degree[i] == 0)
+    eng_queues: dict[str, deque] = defaultdict(deque)
+
+    # stats: per functional engine → {dep_stall, resource_stall, full, partial}
+    FUNC_ENGS = [e for e in SLOT_LIMITS if e != "debug"]
+    stats: dict[str, dict[str, int]] = {
+        e: {"dep_stall": 0, "resource_stall": 0, "full": 0, "partial": 0}
+        for e in FUNC_ENGS
+    }
+
+    def enqueue(nid: int):
+        func_engines = [e for e in nodes[nid].instr if e != "debug"]
+        key = func_engines[0] if func_engines else "debug"
+        eng_queues[key].append(nid)
+
+    for nid in range(n):
+        if in_degree[nid] == 0:
+            enqueue(nid)
 
     result: list[dict] = []
     remaining = n
@@ -224,38 +251,62 @@ def schedule(nodes: list[InstrNode]) -> list[dict]:
         cycle: dict = {}
         slot_counts: dict[str, int] = defaultdict(int)
         scheduled_now: list[int] = []
-        deferred: list[int] = []
+        deferred_by_eng: dict[str, list[int]] = defaultdict(list)
 
-        while ready:
-            nid = ready.popleft()
-            node = nodes[nid]
-            fits = all(
-                slot_counts[eng] + len(slots) <= SLOT_LIMITS[eng]
-                for eng, slots in node.instr.items()
-                if eng != "debug"
-            )
-            if fits:
-                for eng, slots in node.instr.items():
-                    cycle.setdefault(eng, []).extend(slots)
-                    if eng != "debug":
-                        slot_counts[eng] += len(slots)
-                scheduled_now.append(nid)
-            else:
-                deferred.append(nid)
+        for eng, q in eng_queues.items():
+            limit = SLOT_LIMITS.get(eng, n)
+            q_empty_at_start = len(q) == 0
+            while q:
+                nid = q.popleft()
+                node = nodes[nid]
+                fits = all(
+                    slot_counts[e] + len(s) <= SLOT_LIMITS[e]
+                    for e, s in node.instr.items()
+                    if e != "debug"
+                )
+                if fits:
+                    for e, s in node.instr.items():
+                        cycle.setdefault(e, []).extend(s)
+                        if e != "debug":
+                            slot_counts[e] += len(s)
+                    scheduled_now.append(nid)
+                    if slot_counts.get(eng, 0) >= limit:
+                        break
+                else:
+                    deferred_by_eng[eng].append(nid)
+
+            if collect_stats and eng in stats:
+                slots_used  = slot_counts.get(eng, 0)
+                had_deferred = bool(deferred_by_eng.get(eng))
+                hit_limit    = slots_used >= limit
+                if q_empty_at_start and slots_used == 0:
+                    stats[eng]["dep_stall"] += 1
+                elif hit_limit:
+                    stats[eng]["full"] += 1
+                elif had_deferred:
+                    stats[eng]["resource_stall"] += 1
+                elif slots_used > 0:
+                    stats[eng]["partial"] += 1
+                # else: engine not active this cycle and queue was empty → dep_stall
+                elif q_empty_at_start:
+                    stats[eng]["dep_stall"] += 1
 
         if not scheduled_now:
             raise RuntimeError(f"Scheduler deadlock at cycle {len(result)}")
 
-        ready.extend(deferred)
+        for eng, nids in deferred_by_eng.items():
+            eng_queues[eng].extendleft(reversed(nids))
         for nid in scheduled_now:
             for succ_id in successors[nid]:
                 in_degree[succ_id] -= 1
                 if in_degree[succ_id] == 0:
-                    ready.append(succ_id)
+                    enqueue(succ_id)
 
         remaining -= len(scheduled_now)
         result.append(cycle)
 
+    if collect_stats:
+        return result, stats
     return result
 
 
@@ -286,6 +337,8 @@ def assign_vregs(cycles: list[dict], scratch_start: int) -> tuple[list[dict], in
                         else:
                             vreg_info[vid][1] = ci
                             vreg_info[vid][2] = max(vreg_info[vid][2], lbl.lane + 1)
+                if engine == "debug":
+                    continue  # debug reads don't extend live ranges — they're zero-cost
                 for lbl in r:
                     if isinstance(lbl, VRegLane):
                         vid = lbl.vr_id
@@ -302,10 +355,18 @@ def assign_vregs(cycles: list[dict], scratch_start: int) -> tuple[list[dict], in
     ptr = scratch_start
 
     for vr_id, (first, last, size) in sorted(vreg_info.items(), key=lambda x: x[1][0]):
-        # Expire VRegs whose last use is strictly before this interval starts
+        # Expire VRegs whose live range ends at or before this interval's first write.
+        # Same-cycle (<=) reuse is safe in VLIW because reads precede writes within
+        # a cycle — BUT only when the expiring VReg had a genuine (non-debug) read at
+        # that cycle (last_read > first_write).  If last_read == first_write the VReg
+        # was never actually read; expiring it at `<= first` would let two distinct
+        # writes share the same physical slot in the same cycle, which is incorrect.
         still_active, expired = [], []
         for entry in active:
-            (expired if entry[0] < first else still_active).append(entry)
+            lu, vid, base = entry
+            vr_fw = vreg_info[vid][0]
+            should_expire = lu < first or (lu == first and lu > vr_fw)
+            (expired if should_expire else still_active).append(entry)
         for lu, vid, base in expired:
             free[vreg_info[vid][2]].append(base)
         active = still_active
@@ -314,7 +375,6 @@ def assign_vregs(cycles: list[dict], scratch_start: int) -> tuple[list[dict], in
         if phys is None:
             phys = ptr
             ptr += size
-            assert ptr <= SCRATCH_SIZE, f"VReg scratch overflow: {ptr} > {SCRATCH_SIZE}"
 
         alloc[vr_id] = phys
         active.append((last, vr_id, phys))
@@ -433,47 +493,63 @@ class KernelBuilder:
 
     def build_vhash_vreg(self, val_in, round, i):
         """Hash val_in through HASH_STAGES using VRegs (SSA style).
-        Returns (instrs_list, val_out_vreg)."""
+        Returns (instrs_list, val_out_vreg).
+
+        When a madd stage hi is followed by a (a+C)^(a<<s) stage hi+1, both
+        halves of hi+1 are affine in hi's input so they collapse into two
+        parallel multiply_adds + one XOR (2 cycles instead of 3).
+        """
         instrs = []
         val_cur = val_in
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+        hi = 0
+        while hi < len(HASH_STAGES):
+            op1, val1, op2, op3, val3 = HASH_STAGES[hi]
             val_next = VReg()
-            if op1 == "+" and op2 == "+" and op3 == "<<":
+            if (hi + 1 < len(HASH_STAGES)
+                    and op1 == "+" and op2 == "+" and op3 == "<<"
+                    and HASH_STAGES[hi+1][2] == "^" and HASH_STAGES[hi+1][3] == "<<"):
+                # Merge madd(hi) + (a+C)^(a<<s)(hi+1) into 2 VALU cycles.
+                # c = val_cur*M + val1;  d = (c+C_next) ^ (c<<s)
+                # => tmp_a = val_cur*M + (val1+C_next)   [madd, parallel]
+                # => tmp_b = val_cur*(M*2^s) + (val1*2^s) [madd, parallel]
+                # => d = tmp_a ^ tmp_b
+                _, C_next, op2_next, _, s_next = HASH_STAGES[hi+1]
+                M  = 1 + (1 << val3)
+                K1 = (val1 + C_next) & 0xFFFFFFFF
+                M2 = M * (1 << s_next)
+                K2 = (val1 * (1 << s_next)) & 0xFFFFFFFF
+                tmp_a, tmp_b = VReg(), VReg()
+                instrs.append({"valu": [
+                    ("multiply_add", tmp_a, val_cur, self.vec_const(M),  self.vec_const(K1)),
+                    ("multiply_add", tmp_b, val_cur, self.vec_const(M2), self.vec_const(K2)),
+                ]})
+                instrs.append({"valu": [(op2_next, val_next, tmp_a, tmp_b)]})
+                instrs.append({"debug": [("vcompare", val_next, [(round, x, "hash_stage", hi+1) for x in range(i, i+VLEN)])]})
+                val_cur = val_next
+                hi += 2
+            elif op1 == "+" and op2 == "+" and op3 == "<<":
                 mul_const = self.vec_const(1 + (1 << val3))
                 instrs.append({"valu": [("multiply_add", val_next, val_cur, mul_const, self.vec_const(val1))]})
+                instrs.append({"debug": [("vcompare", val_next, [(round, x, "hash_stage", hi) for x in range(i, i+VLEN)])]})
+                val_cur = val_next
+                hi += 1
             else:
                 tmp_a = VReg()
                 tmp_b = VReg()
-                instrs.append({"valu": [(op1, tmp_a, val_cur, self.vec_const(val1))]})
-                instrs.append({"valu": [(op3, tmp_b, val_cur, self.vec_const(val3))]})
+                # Force tmp_a and tmp_b into the same VLIW cycle: both read val_cur
+                # (same dep) so they're always simultaneously ready.
+                instrs.append({"valu": [(op1, tmp_a, val_cur, self.vec_const(val1)),
+                                        (op3, tmp_b, val_cur, self.vec_const(val3))]})
                 instrs.append({"valu": [(op2, val_next, tmp_a, tmp_b)]})
-            instrs.append({"debug": [("vcompare", val_next, [(round, x, "hash_stage", hi) for x in range(i, i+VLEN)])]})
-            val_cur = val_next
+                instrs.append({"debug": [("vcompare", val_next, [(round, x, "hash_stage", hi) for x in range(i, i+VLEN)])]})
+                val_cur = val_next
+                hi += 1
         return instrs, val_cur
-
-    def build_vhash_slotted(self, val_hash_addr, tmp1, tmp2, round, i):
-        slots = []
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            if op1 == "+" and op2 == "+" and op3 == "<<":
-                # a = (a + val1) + (a << val3) = a * (1 + 2**val3) + val1
-                # Use fused multiply_add: dest = a * b + c
-                mul_const = self.vec_const(1 + (1 << val3))
-                slots.append({"valu": [("multiply_add", val_hash_addr, val_hash_addr, mul_const, self.vec_const(val1))]})
-            else:
-                # this is the case where we have this, a is the val_hash_addr
-                # a = (a ^ const1) ^ (a >> const2)
-
-                # a = (a ^ const1 ^ (a >> const2))
-                slots.append({"valu": [(op1, tmp1, val_hash_addr, self.vec_const(val1))]})
-                slots.append({"valu": [(op3, tmp2, val_hash_addr, self.vec_const(val3))]})
-                slots.append({"valu": [(op2, val_hash_addr, tmp1, tmp2)]})
-            slots.append({"debug": [("vcompare", val_hash_addr, [(round, x, "hash_stage", hi) for x in range(i, i+VLEN)])]})
-        return slots
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
-        PIPELINE = 16
+        PIPELINE = 8
         assert batch_size % (PIPELINE * VLEN) == 0
 
         # Shared broadcast vectors for round 0 and 1 tree node values.
@@ -492,8 +568,12 @@ class KernelBuilder:
         nv4_vec  = self.alloc_scratch("nv4_vec",  VLEN)
         nv5_vec  = self.alloc_scratch("nv5_vec",  VLEN)
         nv6_vec  = self.alloc_scratch("nv6_vec",  VLEN)
-        nv_diff_34_vec = self.alloc_scratch("nv_diff_34_vec", VLEN)
-        nv_diff_56_vec = self.alloc_scratch("nv_diff_56_vec", VLEN)
+        nv_diff_34_vec   = self.alloc_scratch("nv_diff_34_vec",   VLEN)
+        nv_diff_56_vec   = self.alloc_scratch("nv_diff_56_vec",   VLEN)
+        # nv_diff_5634 = nv_diff_56 - nv_diff_34  → used to compute nh-nl = ml*nv_diff_5634 + nv_diff_64
+        # nv_diff_64   = nv6 - nv4
+        nv_diff_5634_vec = self.alloc_scratch("nv_diff_5634_vec", VLEN)
+        nv_diff_64_vec   = self.alloc_scratch("nv_diff_64_vec",   VLEN)
         self.scratch_const(1, 2)
         self.scratch_const(3, 4)
         self.scratch_const(5, 6)
@@ -507,8 +587,8 @@ class KernelBuilder:
         ]
         for name, _ in init_vars:
             self.alloc_scratch(name, VLEN)
-        tmp_a = self.alloc_scratch("_init_tmp_a", 2)
-        tmp_b = self.alloc_scratch("_init_tmp_b", 2)
+        tmp_a = self.alloc_scratch("_init_tmp_a", 1)
+        tmp_b = self.alloc_scratch("_init_tmp_b", 1)
         for i in range(0, len(init_vars), 2):
             paired = i + 1 < len(init_vars)
             self.instrs.append({"load": [("const", tmp_a + (i % 2), init_vars[i][1])] + ([("const", tmp_b+ (i % 2), init_vars[i+1][1])] if paired else [])})
@@ -573,9 +653,10 @@ class KernelBuilder:
         self.add("flow",  ("pause",))
         self.add("debug", ("comment", "Starting loop"))
 
-        instrs = []
+        instrs_pre = []
+        instrs_by_i = {}
 
-        # Pre-emit all constants needed by the hash at the top of instrs so they
+        # Pre-emit all constants needed by the hash at the top of instrs_pre so they
         # are visible to the dep-graph and can be scheduled alongside the nv preloads
         # (both are independent load+VALU work). Later vec_const() calls from
         # build_vhash_vreg will be cache hits and emit nothing.
@@ -583,77 +664,138 @@ class KernelBuilder:
         for op1, val1, op2, op3, val3 in HASH_STAGES:
             for v in ([val1, val3, 1 + (1 << val3)] if op1 == "+" and op2 == "+" and op3 == "<<" else [val1, val3]):
                 if v not in seen:
-                    self.vec_const(v, target=instrs)
+                    self.vec_const(v, target=instrs_pre)
                     seen.add(v)
+        # Pre-emit merged constants for any stage pair where a madd is followed by
+        # (a+C)^(a<<s): both halves are affine in the madd input, so computable in
+        # parallel. Currently applies to stages 2+3.
+        hi = 0
+        while hi < len(HASH_STAGES):
+            op1, val1, op2, op3, val3 = HASH_STAGES[hi]
+            if (hi + 1 < len(HASH_STAGES)
+                    and op1 == "+" and op2 == "+" and op3 == "<<"
+                    and HASH_STAGES[hi+1][2] == "^" and HASH_STAGES[hi+1][3] == "<<"):
+                _, C_next, _, _, s_next = HASH_STAGES[hi+1]
+                M  = 1 + (1 << val3)
+                for v in [(val1 + C_next) & 0xFFFFFFFF,   # K1: addend for (c + C_next)
+                          M * (1 << s_next),               # M2: multiplier for (c << s_next)
+                          (val1 * (1 << s_next)) & 0xFFFFFFFF]:  # K2: addend for (c << s_next)
+                    if v not in seen:
+                        self.vec_const(v, target=instrs_pre)
+                        seen.add(v)
+                hi += 2
+            else:
+                hi += 1
 
         # Pre-load tree node values for rounds 0 and 1 (once, shared across all i-iters).
         # Round 0: all idx=0 → broadcast forest_values[0]
-        instrs.append({"load": [("load", nv0_vec, self.scratch["forest_values_p"])]})
-        instrs.append({"valu": [("vbroadcast", nv0_vec, nv0_vec)]})
+        instrs_pre.append({"load": [("load", nv0_vec, self.scratch["forest_values_p"])]})
+        instrs_pre.append({"valu": [("vbroadcast", nv0_vec, nv0_vec)]})
         # Round 1: idx ∈ {1,2} → load forest_values[1] and [2], broadcast each
-        instrs.append({"alu": [
+        instrs_pre.append({"alu": [
             ("+", nv_addr1, self.scratch["forest_values_p"], self.scratch_const(1)),
             ("+", nv_addr2, self.scratch["forest_values_p"], self.scratch_const(2)),
         ]})
-        instrs.append({"load": [
+        instrs_pre.append({"load": [
             ("load", nv1_vec, nv_addr1),
             ("load", nv2_vec, nv_addr2),
         ]})
-        instrs.append({"valu": [
+        instrs_pre.append({"valu": [
             ("vbroadcast", nv1_vec, nv1_vec),
             ("vbroadcast", nv2_vec, nv2_vec),
         ]})
         # Round 2: idx ∈ {3,4,5,6} → preload forest_values[3..6] as broadcast vectors
         # and precompute nv_diff_34 = nv3-nv4, nv_diff_56 = nv5-nv6 for arithmetic mux
-        instrs.append({"alu": [
+        instrs_pre.append({"alu": [
             ("+", nv_addr3, self.scratch["forest_values_p"], self.scratch_const(3)),
             ("+", nv_addr4, self.scratch["forest_values_p"], self.scratch_const(4)),
         ]})
-        instrs.append({"alu": [
+        instrs_pre.append({"alu": [
             ("+", nv_addr5, self.scratch["forest_values_p"], self.scratch_const(5)),
             ("+", nv_addr6, self.scratch["forest_values_p"], self.scratch_const(6)),
         ]})
-        instrs.append({"load": [
+        instrs_pre.append({"load": [
             ("load", nv3_vec, nv_addr3),
             ("load", nv4_vec, nv_addr4),
         ]})
-        instrs.append({"load": [
+        instrs_pre.append({"load": [
             ("load", nv5_vec, nv_addr5),
             ("load", nv6_vec, nv_addr6),
         ]})
-        instrs.append({"valu": [
+        instrs_pre.append({"valu": [
             ("vbroadcast", nv3_vec, nv3_vec),
             ("vbroadcast", nv4_vec, nv4_vec),
         ]})
-        instrs.append({"valu": [
+        instrs_pre.append({"valu": [
             ("vbroadcast", nv5_vec, nv5_vec),
             ("vbroadcast", nv6_vec, nv6_vec),
         ]})
-        instrs.append({"valu": [
+        instrs_pre.append({"valu": [
             ("-", nv_diff_34_vec, nv3_vec, nv4_vec),
             ("-", nv_diff_56_vec, nv5_vec, nv6_vec),
         ]})
+        instrs_pre.append({"valu": [
+            ("-", nv_diff_5634_vec, nv_diff_56_vec, nv_diff_34_vec),
+            ("-", nv_diff_64_vec,   nv6_vec,        nv4_vec),
+        ]})
 
-        for i in range(0, batch_size, PIPELINE * VLEN):
+        # Stagger: delay non-first i-iters by this many ALU cycles so that their
+        # scatter LOAD phases can overlap with i0's non-scatter VALU phases.
+        # The chain computes 1-1=0, then 0+0=0 repeated, gating vloads via fan-out.
+        STAGGER = 112  # base stagger cycles; each i-iter gets STAGGER * i_idx delay
+
+        for i_idx, i in enumerate(range(0, batch_size, PIPELINE * VLEN)):
+            instrs = []
             i_chunk = i // VLEN
             # Per-pipeline VRegs for idx and val — fresh each i-iteration.
             # SSA: each write gets its own VReg; assign_vregs allocates physical slots.
             vr_idx = []
             vr_val = []
+
+            # For non-first i-iters: build ALU delay chain before initial vloads.
+            # Cumulative stagger: i-iter k delayed by STAGGER*k cycles so each
+            # i-iter's scatter phase overlaps a different i-iter's non-scatter phase.
+            delay_idx_slots = None
+            delay_val_slots = None
+            delay_len = STAGGER * i_idx
+            if delay_len > 0:
+                const_1_addr = self.scratch_const(1)
+                # Serial chain: 1-1=0, then 0+0=0 repeated → delay_len cycles of latency
+                dc_slot = self.alloc_scratch(length=1)
+                instrs.append({"alu": [("-", dc_slot, const_1_addr, const_1_addr)]})
+                for _ in range(delay_len - 1):
+                    instrs.append({"alu": [("+", dc_slot, dc_slot, dc_slot)]})
+                # Fan-out: stride_ptr + 0 = stride_ptr, gated through dc_slot
+                delay_idx_slots = []
+                delay_val_slots = []
+                fan_ops = []
+                for p in range(PIPELINE):
+                    k = i_chunk + p
+                    di = self.alloc_scratch(length=1)
+                    dv = self.alloc_scratch(length=1)
+                    delay_idx_slots.append(di)
+                    delay_val_slots.append(dv)
+                    fan_ops.append(("+", di, idx_ptr_base + k, dc_slot))
+                    fan_ops.append(("+", dv, val_ptr_base + k, dc_slot))
+                for fi in range(0, len(fan_ops), 12):
+                    instrs.append({"alu": fan_ops[fi:fi+12]})
+
             for p in range(PIPELINE):
                 k      = i_chunk + p
                 offset = i + p * VLEN
                 vi, vv = VReg(), VReg()
                 vr_idx.append(vi)
                 vr_val.append(vv)
-                # instrs.append({"load": [
-                #     ("vload", vi, idx_ptr_base + k),
-                #     ("vload", vv, val_ptr_base + k),
-                # ]})
-                instrs.append({"load": [
-                    ("vload", vi, idx_ptr_base + k),
-                    ("vload", vv, val_ptr_base + k),
-                ]})
+                if delay_idx_slots is not None:
+                    instrs.append({"load": [
+                        ("vload", vi, delay_idx_slots[p]),
+                        ("vload", vv, delay_val_slots[p]),
+                    ]})
+                else:
+                    instrs.append({"load": [
+                        ("vload", vi, idx_ptr_base + k),
+                        ("vload", vv, val_ptr_base + k),
+                    ]})
                 instrs.append({"debug": [("vcompare", vi, [(0, x, "idx") for x in range(offset, offset+VLEN)])]})
                 instrs.append({"debug": [("vcompare", vv, [(0, x, "val") for x in range(offset, offset+VLEN)])]})
 
@@ -678,9 +820,8 @@ class KernelBuilder:
                         instrs.append({"debug": [("vcompare", vr_idx_new, [(round, x, "next_idx")    for x in range(offset, offset+VLEN)])]})
                         instrs.append({"debug": [("vcompare", vr_idx_new, [(round, x, "wrapped_idx") for x in range(offset, offset+VLEN)])]})
                         vr_val[p], vr_idx[p] = vr_hashed, vr_idx_new
-                        store_slots = [] if is_last else [("vstore", idx_ptr_base + k, vr_idx_new)]
-                        store_slots += [("vstore", val_ptr_base + k, vr_hashed)]
-                        instrs.append({"store": store_slots})
+                        if is_last:
+                            instrs.append({"store": [("vstore", val_ptr_base + k, vr_hashed)]})
 
                 elif effective == 1:
                     for p in range(PIPELINE):
@@ -702,31 +843,32 @@ class KernelBuilder:
                         instrs.append({"debug": [("vcompare", vr_idx_new, [(round, x, "next_idx")    for x in range(offset, offset+VLEN)])]})
                         instrs.append({"debug": [("vcompare", vr_idx_new, [(round, x, "wrapped_idx") for x in range(offset, offset+VLEN)])]})
                         vr_val[p], vr_idx[p] = vr_hashed, vr_idx_new
-                        store_slots = [] if is_last else [("vstore", idx_ptr_base + k, vr_idx_new)]
-                        store_slots += [("vstore", val_ptr_base + k, vr_hashed)]
-                        instrs.append({"store": store_slots})
+                        if is_last:
+                            instrs.append({"store": [("vstore", val_ptr_base + k, vr_hashed)]})
 
                 elif effective == 2:
                     # idx ∈ {3,4,5,6} — arithmetic 4-way mux, no scatter loads.
                     # ml = idx & 1, mh = 4 < idx
-                    # nl = ml*(nv3−nv4)+nv4, nh = ml*(nv5−nv6)+nv6
-                    # diff = nh − nl, node_val = mh*diff + nl
+                    # nl    = ml*(nv3−nv4)+nv4
+                    # diff  = ml*nv_diff_5634 + nv_diff_64  (= nh_old − nl)
+                    # node_val = mh*diff + nl
+                    # Depth 3: [ml||mh] → [nl||diff] → [vr_nv]  (vs old depth 4 with nh)
                     for p in range(PIPELINE):
                         k      = i_chunk + p
                         offset = i + p * VLEN
-                        ml, mh, nl, nh = VReg(), VReg(), VReg(), VReg()
-                        instrs.append({"valu": [("&", ml, vr_idx[p], one_vec)]})
-                        instrs.append({"valu": [("<", mh, four_vec, vr_idx[p])]})
+                        ml, mh = VReg(), VReg()
+                        # ml and mh both depend only on vr_idx[p] — force same VLIW slot
+                        instrs.append({"valu": [("&", ml, vr_idx[p], one_vec), ("<", mh, four_vec, vr_idx[p])]})
+                        nl, vr_diff = VReg(), VReg()
                         instrs.append({"valu": [
-                            ("multiply_add", nl, ml, nv_diff_34_vec, nv4_vec),
-                            ("multiply_add", nh, ml, nv_diff_56_vec, nv6_vec),
+                            ("multiply_add", nl,      ml, nv_diff_34_vec,   nv4_vec),
+                            ("multiply_add", vr_diff, ml, nv_diff_5634_vec, nv_diff_64_vec),
                         ]})
-                        vr_diff, vr_nv = VReg(), VReg()
-                        instrs.append({"valu": [("-", vr_diff, nh, nl)]})
+                        vr_nv = VReg()
                         instrs.append({"valu": [("multiply_add", vr_nv, mh, vr_diff, nl)]})
                         instrs.append({"debug": [("vcompare", vr_nv, [(round, x, "node_val") for x in range(offset, offset+VLEN)])]})
                         vr_xor = VReg()
-                        instrs.append({"valu": [("^", vr_xor, vr_val[p], vr_nv)]})
+                        instrs.extend(vexec_alu("^", vr_xor, vr_val[p], vr_nv, p))
                         h_instrs, vr_hashed = self.build_vhash_vreg(vr_xor, round, offset)
                         instrs.extend(h_instrs)
                         instrs.append({"debug": [("vcompare", vr_hashed, [(round, x, "hashed_val") for x in range(offset, offset+VLEN)])]})
@@ -737,15 +879,19 @@ class KernelBuilder:
                         instrs.append({"debug": [("vcompare", vr_idx_new, [(round, x, "next_idx")    for x in range(offset, offset+VLEN)])]})
                         instrs.append({"debug": [("vcompare", vr_idx_new, [(round, x, "wrapped_idx") for x in range(offset, offset+VLEN)])]})
                         vr_val[p], vr_idx[p] = vr_hashed, vr_idx_new
-                        store_slots = [] if is_last else [("vstore", idx_ptr_base + k, vr_idx_new)]
-                        store_slots += [("vstore", val_ptr_base + k, vr_hashed)]
-                        instrs.append({"store": store_slots})
+                        if is_last:
+                            instrs.append({"store": [("vstore", val_ptr_base + k, vr_hashed)]})
 
                 else:
                     # Full scatter load.
                     for p in range(PIPELINE):
                         k      = i_chunk + p
                         offset = i + p * VLEN
+                        # Precompute 2*idx+1 before the hash chain — hides behind
+                        # addr computation + scatter loads + xor + hash (9+ cycles).
+                        # Reduces post-hash dep depth: 5→4 (removes bit1 serial step).
+                        vr_idx_2x1 = VReg()
+                        instrs.append({"valu": [("multiply_add", vr_idx_2x1, vr_idx[p], two_vec, one_vec)]})
                         vr_addr, vr_nv = VReg(), VReg()
                         instrs.extend(vexec_valu("+", vr_addr, self.scratch["forest_values_p"], vr_idx[p], p))
                         for j in range(0, VLEN, 2):
@@ -759,24 +905,48 @@ class KernelBuilder:
                         h_instrs, vr_hashed = self.build_vhash_vreg(vr_xor, round, offset)
                         instrs.extend(h_instrs)
                         instrs.append({"debug": [("vcompare", vr_hashed, [(round, x, "hashed_val") for x in range(offset, offset+VLEN)])]})
-                        vr_bit, vr_bit1, vr_idx_pre = VReg(), VReg(), VReg()
+                        # Post-hash depth 4: bit → idx_pre(=idx_2x1+bit) → cmp → idx_new
+                        vr_bit, vr_idx_pre = VReg(), VReg()
                         instrs.extend(vexec_valu("&", vr_bit, vr_hashed, one_vec, p))
-                        instrs.extend(vexec_valu("+", vr_bit1, vr_bit, one_vec, p))
-                        instrs.append({"valu": [("multiply_add", vr_idx_pre, vr_idx[p], two_vec, vr_bit1)]})
+                        instrs.extend(vexec_valu("+", vr_idx_pre, vr_idx_2x1, vr_bit, p))
                         instrs.append({"debug": [("vcompare", vr_idx_pre, [(round, x, "next_idx") for x in range(offset, offset+VLEN)])]})
                         vr_cmp, vr_idx_new = VReg(), VReg()
                         instrs.extend(vexec_valu("<", vr_cmp, vr_idx_pre, self.scratch["n_nodes"], p))
                         instrs.append({"flow": [("vselect", vr_idx_new, vr_cmp, vr_idx_pre, zero_vec)]})
                         instrs.append({"debug": [("vcompare", vr_idx_new, [(round, x, "wrapped_idx") for x in range(offset, offset+VLEN)])]})
                         vr_val[p], vr_idx[p] = vr_hashed, vr_idx_new
-                        store_slots = [] if is_last else [("vstore", idx_ptr_base + k, vr_idx_new)]
-                        store_slots += [("vstore", val_ptr_base + k, vr_hashed)]
-                        instrs.append({"store": store_slots})
+                        if is_last:
+                            instrs.append({"store": [("vstore", val_ptr_base + k, vr_hashed)]})
 
-        nodes = build_dep_graph(instrs)
-        scheduled = schedule(nodes)
-        scheduled, _ = assign_vregs(scheduled, self.scratch_ptr)
-        self.instrs.extend(scheduled)
+            instrs_by_i[i] = instrs
+
+        # Combine all iterations into a single dep graph so the scheduler can
+        # interleave instructions from different pipelines and iterations for
+        # maximum VLIW slot utilization.
+        all_instrs = instrs_pre
+        for i in range(0, batch_size, PIPELINE * VLEN):
+            all_instrs = all_instrs + instrs_by_i[i]
+
+        nodes = build_dep_graph(all_instrs)
+
+        sched, sched_stats = schedule(nodes, collect_stats=True)
+        # --- scheduling diagnostic ---
+        eng_slots = defaultdict(int)
+        for cyc in sched:
+            for eng, slots in cyc.items():
+                if eng != "debug":
+                    eng_slots[eng] += len(slots)
+        ncyc = len(sched)
+        print(f"  sched cycles={ncyc}")
+        print(f"  {'eng':<6} {'util%':>6}  {'dep_stall':>10} {'resource_stall':>15} {'full':>6} {'partial':>8}")
+        for eng in ["alu", "valu", "load", "store", "flow"]:
+            lim = SLOT_LIMITS.get(eng, 1)
+            util = eng_slots[eng] / (ncyc * lim) * 100
+            s = sched_stats[eng]
+            print(f"  {eng:<6} {util:>6.1f}%  {s['dep_stall']:>10} {s['resource_stall']:>15} {s['full']:>6} {s['partial']:>8}")
+        # ----------------------------
+        sched, _ = assign_vregs(sched, self.scratch_ptr)
+        self.instrs.extend(sched)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
