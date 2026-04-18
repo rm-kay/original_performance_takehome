@@ -538,6 +538,41 @@ class KernelBuilder:
         PIPELINE = 8
         assert batch_size % (PIPELINE * VLEN) == 0
 
+        # Scalar pointers for inp_indices_p (mem[5]) and inp_values_p (mem[6])
+        inp_indices_p_s = self.alloc_scratch("inp_indices_p_s", 1)
+        inp_values_p_s  = self.alloc_scratch("inp_values_p_s",  1)
+        self.instrs.append({"load": [("const", inp_indices_p_s, 5), ("const", inp_values_p_s, 6)]})
+        self.instrs.append({"load": [("load", inp_indices_p_s, inp_indices_p_s), ("load", inp_values_p_s, inp_values_p_s)]})
+
+        # Stride tables: scratch[idx_ptr_base + k] = inp_indices_p_val + k*VLEN
+        # so vload(dest, idx_ptr_base + k) loads the k-th VLEN chunk of the array.
+        # Binary-tree fanout: 3 const pairs → 5 ALU levels → all 32 entries.
+        # Fewer const loads means ptr_load reaches the FIFO front sooner.
+        n_chunks = batch_size // VLEN
+        idx_ptr_base = self.alloc_scratch("idx_ptrs", n_chunks)
+        val_ptr_base = self.alloc_scratch("val_ptrs", n_chunks)
+        c0,  c128 = self.scratch_const(0,  128)
+        c64, c32  = self.scratch_const(64, 32)
+        c16, c8   = self.scratch_const(16, 8)
+
+        def emit_stride_level(ops):
+            for i in range(0, len(ops), 12):
+                self.instrs.append({"alu": ops[i:i+12]})
+
+        # L0: anchor entries directly from inp_ptr
+        emit_stride_level([op for k, c in [(0, c0), (16, c128)] for op in [
+            ("+", idx_ptr_base + k, inp_indices_p_s, c),
+            ("+", val_ptr_base + k, inp_values_p_s,  c),
+        ]])
+        # L1-L4: entry k = entry[k - gap] + gap*VLEN
+        for gap, c in [(8, c64), (4, c32), (2, c16), (1, c8)]:
+            entries = [k for k in range(n_chunks) if k % gap == 0 and k % (2 * gap) != 0]
+            emit_stride_level([op for k in entries for op in [
+                ("+", idx_ptr_base + k, idx_ptr_base + (k - gap), c),
+                ("+", val_ptr_base + k, val_ptr_base + (k - gap), c),
+            ]])
+
+
         # Shared broadcast vectors for round 0 and 1 tree node values.
         # All elements start at idx=0, so round 0 always loads forest_values[0].
         # After round 0, idx ∈ {1,2}; after round 1, idx ∈ {3,4,5,6}.
@@ -564,23 +599,16 @@ class KernelBuilder:
         self.scratch_const(3, 4)
         self.scratch_const(5, 6)
 
-        # Shared init vars — broadcast scalars into VLEN vectors so valu can use them.
-        # Only load what's actually used as a vector in instructions.
-        # mem layout: 0=rounds,1=n_nodes,2=batch_size,3=forest_height,4=forest_values_p,5=inp_indices_p,6=inp_values_p
-        init_vars = [
-            ("n_nodes",         1),
-            ("forest_values_p", 4),
-        ]
-        for name, _ in init_vars:
-            self.alloc_scratch(name, VLEN)
+        # Load n_nodes (mem[1]) and forest_values_p (mem[4]) and vbroadcast into vectors.
+        # mem layout: 0=rounds,1=n_nodes,2=batch_size,3=forest_height,4=forest_values_p,...
+        self.alloc_scratch("n_nodes",         VLEN)
+        self.alloc_scratch("forest_values_p", VLEN)
         tmp_a = self.alloc_scratch("_init_tmp_a", 1)
         tmp_b = self.alloc_scratch("_init_tmp_b", 1)
-        for i in range(0, len(init_vars), 2):
-            paired = i + 1 < len(init_vars)
-            self.instrs.append({"load": [("const", tmp_a + (i % 2), init_vars[i][1])] + ([("const", tmp_b+ (i % 2), init_vars[i+1][1])] if paired else [])})
-            self.instrs.append({"load": [("load", tmp_a+ (i % 2), tmp_a+ (i % 2))] + ([("load", tmp_b+ (i % 2), tmp_b+ (i % 2))] if paired else [])})
-            self.instrs.append({"valu": [("vbroadcast", self.scratch[init_vars[i][0]], tmp_a+ (i % 2))]
-                                       + ([("vbroadcast", self.scratch[init_vars[i+1][0]], tmp_b+ (i % 2))] if paired else [])})
+        self.instrs.append({"load": [("const", tmp_a, 1), ("const", tmp_b, 4)]})
+        self.instrs.append({"load": [("load",  tmp_a, tmp_a), ("load",  tmp_b, tmp_b)]})
+        self.instrs.append({"valu": [("vbroadcast", self.scratch["n_nodes"],         tmp_a),
+                                     ("vbroadcast", self.scratch["forest_values_p"], tmp_b)]})
 
         one_vec  = self.vec_const(1)
         vecs = self.alloc_scratch(length=VLEN*3)
@@ -606,26 +634,6 @@ class KernelBuilder:
             if use_alu:
                 return [{"alu": [(op, _lane(dest, j), _lane(a1, j), _lane(a2, j)) for j in range(VLEN)]}]
             return [{"valu": [(op, dest, a1, a2)]}]
-
-        # Scalar pointers for inp_indices_p (mem[5]) and inp_values_p (mem[6])
-        inp_indices_p_s = self.alloc_scratch("inp_indices_p_s", 1)
-        inp_values_p_s  = self.alloc_scratch("inp_values_p_s",  1)
-        self.instrs.append({"load": [("const", inp_indices_p_s, 5), ("const", inp_values_p_s, 6)]})
-        self.instrs.append({"load": [("load", inp_indices_p_s, inp_indices_p_s), ("load", inp_values_p_s, inp_values_p_s)]})
-
-        # Stride tables: scratch[idx_ptr_base + k] = inp_indices_p_val + k*VLEN
-        # so vload(dest, idx_ptr_base + k) loads the k-th VLEN chunk of the array.
-        n_chunks = batch_size // VLEN
-        idx_ptr_base = self.alloc_scratch("idx_ptrs", n_chunks)
-        val_ptr_base = self.alloc_scratch("val_ptrs", n_chunks)
-        for k in range(0, n_chunks, 2):
-            off_c, off_c2 = self.scratch_const(k * VLEN, k * VLEN + VLEN)
-            self.instrs.append({"alu": [
-                ("+", idx_ptr_base + k, inp_indices_p_s, off_c),
-                ("+", val_ptr_base + k, inp_values_p_s,  off_c),
-                ("+", idx_ptr_base + k+1, inp_indices_p_s, off_c2),
-                ("+", val_ptr_base + k+1, inp_values_p_s,  off_c2),
-            ]})
 
         # Schedule the pre-pause segment so stride table ALU, init_vars, and const
         # loads are packed rather than emitted sequentially.
